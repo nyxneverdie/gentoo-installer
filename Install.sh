@@ -9,7 +9,7 @@
 #
 #  CARA PAKAI
 #    1. Boot Gentoo Minimal Installation CD dalam mode UEFI (Secure Boot OFF)
-#       dan pastikan internet aktif (Wi-Fi: `iwctl` / `net-setup`).
+#       dan pastikan internet aktif (bisa disambungkan langsung oleh script ini).
 #    2. Salin script ini ke live environment, lalu:
 #         chmod +x gentoo-install.sh && ./gentoo-install.sh
 #    3. Jawab pertanyaan (Enter = pakai default).
@@ -37,6 +37,10 @@
 #         CUPS_GUTENPRINT=yes CUPS_HPLIP=no CUPS_BRLASER=no
 #         CUPS_PDF=yes CUPS_AVAHI=yes
 #         INSTALL_BLUETOOTH=yes
+#         INSTALL_PIPEWIRE=yes
+#         NET_MODE=wifi                # wifi | wired | netsetup (dipakai bila belum online)
+#         WIFI_SSID='NamaWiFi' WIFI_PASS='passwordwifi'
+#         SAVE_WIFI=yes                # simpan Wi-Fi ke sistem baru
 #         INSTALL_ELOGIND=yes          # elogind + polkit
 #         INSTALL_SSHD=no
 #         INSTALL_CRON=yes ENABLE_FSTRIM=yes
@@ -207,6 +211,401 @@ fetch_file() { # url dest
 # =============================================================================
 #  TAHAP 1 — HOST (live environment)
 # =============================================================================
+# =============================================================================
+#  Jaringan di live environment (pilih + sambung otomatis)
+#  Memakai tool bawaan ISO minimal Gentoo: wpa_supplicant + wpa_cli + dhcpcd
+#  (iwctl / nmcli TIDAK ada di ISO minimal). Cadangan: wizard `net-setup`.
+# =============================================================================
+WPA_CONF="/tmp/wpa-install.conf"
+WPA_CTRL="/run/wpa_supplicant"
+
+check_internet() {
+    getent hosts distfiles.gentoo.org >/dev/null 2>&1 || return 1
+    if ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then return 0; fi
+    if command -v wget >/dev/null 2>&1; then
+        wget -q --spider --timeout=8 --tries=1 https://distfiles.gentoo.org
+    else
+        curl -fsI --max-time 8 https://distfiles.gentoo.org >/dev/null 2>&1
+    fi
+}
+
+# wait_online DETIK [interface]  — bila interface diberikan, wajib punya IPv4
+wait_online() {
+    local t="${1:-30}" need_if="${2:-}" i
+    for (( i = 0; i < t; i += 2 )); do
+        if [[ -n "$need_if" ]] && ! ip -4 -o addr show dev "$need_if" 2>/dev/null | grep -q 'inet '; then
+            sleep 2
+            continue
+        fi
+        if check_internet; then return 0; fi
+        if ! getent hosts distfiles.gentoo.org >/dev/null 2>&1 \
+           && ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then
+            warn "DNS belum berfungsi — memakai resolver sementara 1.1.1.1 / 9.9.9.9"
+            printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' > /etc/resolv.conf
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+list_ifaces() { # wifi | wired
+    local d n
+    for d in /sys/class/net/*; do
+        n="${d##*/}"
+        if [[ "$n" == "lo" ]]; then continue; fi
+        if [[ -d "$d/wireless" || -d "$d/phy80211" ]]; then
+            if [[ "$1" == "wifi" ]]; then echo "$n"; fi
+        elif [[ -e "$d/device" && "$1" == "wired" ]]; then
+            echo "$n"
+        fi
+    done
+    return 0
+}
+
+pick_iface() { # wifi|wired NAMA_VARIABEL
+    local kind="$1" var="$2" n
+    local -a ifs=() opts=()
+    mapfile -t ifs < <(list_ifaces "$kind")
+    if (( ${#ifs[@]} == 0 )); then
+        warn "Tidak ada interface ${kind} yang ditemukan."
+        return 1
+    fi
+    if (( ${#ifs[@]} == 1 )); then
+        printf -v "$var" '%s' "${ifs[0]}"
+        return 0
+    fi
+    for n in "${ifs[@]}"; do opts+=("${n}|${n}"); done
+    choose "$var" "Pilih interface ${kind}" 1 "${opts[@]}"
+}
+
+run_dhcp() {
+    local ifc="$1"
+    ip link set "$ifc" up >/dev/null 2>&1 || true
+    if command -v dhcpcd >/dev/null 2>&1; then
+        if pgrep -x dhcpcd >/dev/null 2>&1; then
+            dhcpcd -n -q "$ifc" >/dev/null 2>&1 || true      # daemon live ISO sudah jalan: rebind
+        else
+            timeout 40 dhcpcd -w -q "$ifc" >/dev/null 2>&1 || true
+        fi
+    elif command -v dhclient >/dev/null 2>&1; then
+        timeout 40 dhclient "$ifc" >/dev/null 2>&1 || true
+    elif command -v udhcpc >/dev/null 2>&1; then
+        timeout 40 udhcpc -i "$ifc" -q >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+wpa_stop() { # iface
+    rc-service wpa_supplicant stop >/dev/null 2>&1 || true
+    pkill -f -- "wpa_supplicant.* -i ?${1}( |\$)" >/dev/null 2>&1 || true
+    sleep 1
+}
+
+# write_wpa_conf            -> konfigurasi dasar (hanya untuk scan)
+# write_wpa_conf SSID PASS SEC(psk|sae|unknown)
+write_wpa_conf() {
+    local ssid="${1:-}" pass="${2:-}" sec="${3:-psk}" hex psk esc
+    (
+        umask 077
+        {
+            printf 'ctrl_interface=%s\nctrl_interface_group=0\nupdate_config=0\n' "$WPA_CTRL"
+            if [[ -n "$ssid" ]]; then
+                hex="$(printf '%s' "$ssid" | od -An -tx1 | tr -d ' \n')"
+                echo 'network={'
+                printf '\tssid=%s\n\tscan_ssid=1\n' "$hex"
+                if [[ -z "$pass" ]]; then
+                    printf '\tkey_mgmt=NONE\n'
+                elif [[ "$sec" == "sae" ]]; then
+                    esc="${pass//\\/\\\\}"
+                    esc="${esc//\"/\\\"}"
+                    printf '\tkey_mgmt=SAE\n\tsae_password="%s"\n\tieee80211w=2\n' "$esc"
+                else
+                    if [[ "$pass" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+                        psk="$pass"
+                    else
+                        psk="$(printf '%s\n' "$pass" | wpa_passphrase "$ssid" 2>/dev/null \
+                               | sed -n 's/^[[:space:]]*psk=//p')" || psk=""
+                    fi
+                    [[ -n "$psk" ]] || exit 1
+                    printf '\tkey_mgmt=WPA-PSK\n\tpsk=%s\n' "$psk"
+                fi
+                echo '}'
+            fi
+        } > "$WPA_CONF"
+    )
+}
+
+wpa_start() { # iface — memakai $WPA_CONF
+    local ifc="$1"
+    wpa_stop "$ifc"
+    rfkill unblock wifi >/dev/null 2>&1 || true
+    ip link set "$ifc" up >/dev/null 2>&1 || true
+    wpa_supplicant -B -i "$ifc" -c "$WPA_CONF" >/dev/null 2>&1
+}
+
+wait_assoc() { # iface [detik]
+    local ifc="$1" t="${2:-20}" i
+    for (( i = 0; i < t; i += 2 )); do
+        if wpa_cli -p "$WPA_CTRL" -i "$ifc" status 2>/dev/null | grep -q '^wpa_state=COMPLETED'; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+scan_wifi() { # iface -> baris "ssid|sinyal|keamanan" (psk|sae|open|wep|8021x)
+    local ifc="$1" i raw sig sec ssid
+    if ! command -v wpa_cli >/dev/null 2>&1; then return 0; fi
+    write_wpa_conf || true
+    if ! wpa_start "$ifc"; then
+        warn "wpa_supplicant gagal dijalankan pada ${ifc}."
+        return 0
+    fi
+    sleep 1
+    for i in 1 2 3; do
+        if wpa_cli -p "$WPA_CTRL" -i "$ifc" scan 2>/dev/null | grep -q '^OK'; then break; fi
+        sleep 2
+    done
+    sleep 5
+    wpa_cli -p "$WPA_CTRL" -i "$ifc" scan_results 2>/dev/null \
+        | awk -F'\t' '
+            NR > 1 && $5 != "" && $5 !~ /^(\\x00)+$/ && $5 !~ /\|/ {
+                sig = $3 + 0; fl = $4
+                if (sig > 0) pct = sig; else pct = 2 * (sig + 100)
+                if (pct > 100) pct = 100
+                if (pct < 0) pct = 0
+                if (fl ~ /EAP/) sec = "8021x"
+                else if (fl ~ /SAE/ && fl !~ /PSK/) sec = "sae"
+                else if (fl ~ /WPA|RSN|PSK/) sec = "psk"
+                else if (fl ~ /WEP/) sec = "wep"
+                else sec = "open"
+                if (!($5 in best) || pct > best[$5]) { best[$5] = pct; secs[$5] = sec }
+            }
+            END { for (s in best) printf "%d|%s|%d%%|%s\n", best[s], s, best[s], secs[s] }' \
+        | sort -t'|' -k1,1nr | cut -d'|' -f2- \
+        | while IFS='|' read -r raw sig sec; do
+              ssid="$(printf '%b' "$raw")"
+              printf '%s|%s|%s\n' "$ssid" "$sig" "$sec"
+          done
+    return 0
+}
+
+connect_wifi() { # iface ssid pass sec
+    local ifc="$1" ssid="$2" pass="$3" sec="$4"
+    if ! write_wpa_conf "$ssid" "$pass" "$sec"; then
+        warn "Gagal membuat konfigurasi (password WPA-PSK harus 8–63 karakter atau 64 hex)."
+        return 1
+    fi
+    if ! wpa_start "$ifc"; then
+        warn "wpa_supplicant gagal dijalankan."
+        return 1
+    fi
+    if command -v wpa_cli >/dev/null 2>&1; then
+        if ! wait_assoc "$ifc" 24; then
+            warn "Tidak bisa terhubung ke access point (password salah / sinyal lemah)."
+            return 1
+        fi
+    fi
+    run_dhcp "$ifc"
+}
+
+setup_wifi() {
+    local ifc ssid pass hidden sec sel hint n s_ssid s_sig s_sec got fails=0
+    local -a nets=() opts=()
+    local -A SEC=()
+
+    if ! command -v wpa_supplicant >/dev/null 2>&1; then
+        warn "wpa_supplicant tidak ditemukan di live environment. Coba opsi net-setup."
+        return 1
+    fi
+    if ! pick_iface wifi WIFI_IFACE; then return 1; fi
+    ifc="$WIFI_IFACE"
+    info "Wi-Fi: interface=${ifc} (wpa_supplicant + dhcpcd)"
+
+    while true; do
+        ssid=""; pass=""; hidden="${WIFI_HIDDEN:-no}"; sec="psk"
+
+        if [[ -n "${WIFI_SSID:-}" ]]; then
+            ssid="$WIFI_SSID"
+            pass="${WIFI_PASS:-}"
+            sec="${WIFI_SECURITY:-psk}"
+        else
+            if (( NONINTERACTIVE )); then
+                warn "Mode non-interaktif: WIFI_SSID wajib diset."
+                return 1
+            fi
+            info "Memindai jaringan Wi-Fi (±8 detik) ..."
+            mapfile -t nets < <(scan_wifi "$ifc")
+            opts=(); SEC=()
+            for n in "${nets[@]}"; do
+                IFS='|' read -r s_ssid s_sig s_sec <<<"$n"
+                [[ -n "$s_ssid" ]] || continue
+                SEC["$s_ssid"]="$s_sec"
+                opts+=("${s_ssid}|${s_ssid}   [sinyal ${s_sig}, ${s_sec}]")
+            done
+            opts+=("__manual|Ketik SSID manual (jaringan tersembunyi)" "__rescan|Pindai ulang")
+            sel=""
+            choose sel "Pilih jaringan Wi-Fi" 1 "${opts[@]}"
+            case "$sel" in
+                __rescan) continue ;;
+                __manual)
+                    read -r -p "SSID: " ssid
+                    [[ -n "$ssid" ]] || continue
+                    hidden="yes"; sec="unknown"
+                    ;;
+                *)
+                    ssid="$sel"
+                    sec="${SEC[$sel]:-psk}"
+                    ;;
+            esac
+            if [[ "$sec" == "8021x" || "$sec" == "wep" ]]; then
+                warn "Keamanan '${sec}' (WPA-Enterprise/WEP) tidak didukung script ini. Pilih jaringan lain."
+                continue
+            fi
+            if [[ "$sec" != "open" ]]; then
+                hint=""
+                if [[ "$sec" == "unknown" ]]; then hint=" (kosong = jaringan terbuka)"; fi
+                read -r -s -p "Password Wi-Fi '${ssid}'${hint}: " pass; echo
+                if [[ -z "$pass" && "$sec" != "unknown" ]]; then
+                    warn "Password tidak boleh kosong untuk jaringan terproteksi."
+                    continue
+                fi
+            fi
+        fi
+        if [[ -z "$pass" ]]; then sec="open"; fi
+
+        info "Menyambung ke '${ssid}' ..."
+        got=0
+        if connect_wifi "$ifc" "$ssid" "$pass" "$sec" && wait_online 30 "$ifc"; then
+            got=1
+        elif [[ "$sec" == "unknown" && -n "$pass" ]]; then
+            info "Mencoba sebagai WPA3 (SAE) ..."
+            if connect_wifi "$ifc" "$ssid" "$pass" sae && wait_online 30 "$ifc"; then
+                sec="sae"; got=1
+            fi
+        fi
+        if (( got )); then
+            if [[ "$sec" == "unknown" ]]; then sec="psk"; fi
+            WIFI_SSID="$ssid"; WIFI_PASS="$pass"; WIFI_HIDDEN="$hidden"; WIFI_SEC="$sec"
+            ok "Tersambung ke '${ssid}' dan internet aktif."
+            return 0
+        fi
+        warn "Gagal tersambung atau tidak ada internet."
+        if (( NONINTERACTIVE )); then return 1; fi
+        unset WIFI_SSID WIFI_PASS
+        fails=$((fails + 1))
+        if (( fails >= 3 )); then return 1; fi
+    done
+}
+
+setup_wired() {
+    local ifc
+    if ! pick_iface wired WIRED_IFACE; then return 1; fi
+    ifc="$WIRED_IFACE"
+    info "Menyambung kabel LAN (${ifc}) via DHCP ..."
+    run_dhcp "$ifc"
+    if wait_online 30 "$ifc"; then
+        ok "Kabel LAN tersambung dan internet aktif."
+        return 0
+    fi
+    return 1
+}
+
+ensure_network() {
+    local -a nopts=()
+    info "Memeriksa koneksi internet ..."
+    if check_internet; then
+        ok "Sudah terhubung ke internet."
+        if (( NONINTERACTIVE )); then return 0; fi
+        yesno NET_RECONFIGURE "Pilih / ganti jaringan lain?" no
+        if ! is_yes NET_RECONFIGURE; then return 0; fi
+    else
+        warn "Belum ada koneksi internet."
+        if (( NONINTERACTIVE )) && [[ -z "${NET_MODE:-}" ]]; then
+            die "Tidak ada internet. Set NET_MODE=wifi|wired di config (+ WIFI_SSID / WIFI_PASS untuk Wi-Fi)."
+        fi
+    fi
+
+    nopts=("wifi|Wi-Fi (pindai & pilih SSID)" "wired|Kabel LAN (DHCP otomatis)")
+    if command -v net-setup >/dev/null 2>&1; then
+        nopts+=("netsetup|Wizard bawaan Gentoo (net-setup)")
+    fi
+    nopts+=("recheck|Sudah saya sambungkan manual — cek ulang" "abort|Batal")
+
+    while true; do
+        choose NET_MODE "Pilih jenis koneksi" 1 "${nopts[@]}"
+        case "$NET_MODE" in
+            wifi)
+                if setup_wifi; then
+                    yesno SAVE_WIFI "Simpan Wi-Fi ini ke sistem baru (otomatis tersambung setelah reboot)?" yes
+                    return 0
+                fi
+                ;;
+            wired)
+                if setup_wired; then return 0; fi
+                ;;
+            netsetup)
+                net-setup || true
+                if wait_online 20; then ok "Internet aktif."; return 0; fi
+                ;;
+            recheck)
+                if wait_online 10; then ok "Internet aktif."; return 0; fi
+                ;;
+            abort)
+                die "Dibatalkan: tidak ada koneksi internet."
+                ;;
+            *)
+                die "NET_MODE tidak valid: ${NET_MODE}"
+                ;;
+        esac
+        warn "Koneksi belum berhasil."
+        if (( NONINTERACTIVE )); then die "Gagal menyambung ke internet."; fi
+        unset NET_MODE
+    done
+}
+
+# Simpan profil Wi-Fi ke sistem baru (NetworkManager keyfile) agar langsung tersambung setelah reboot
+write_wifi_profile() {
+    if ! is_yes SAVE_WIFI || [[ -z "${WIFI_SSID:-}" ]]; then return 0; fi
+    local dir="${TARGET}/etc/NetworkManager/system-connections" safe f kmgmt="wpa-psk"
+    if [[ "${WIFI_SEC:-psk}" == "sae" ]]; then kmgmt="sae"; fi
+    safe="$(printf '%s' "$WIFI_SSID" | tr -c 'A-Za-z0-9._-' '_')"
+    f="${dir}/${safe}.nmconnection"
+    mkdir -p "$dir"
+    (
+        umask 077
+        {
+            echo "[connection]"
+            echo "id=${WIFI_SSID}"
+            echo "uuid=$(cat /proc/sys/kernel/random/uuid)"
+            echo "type=wifi"
+            echo "autoconnect=true"
+            echo
+            echo "[wifi]"
+            echo "mode=infrastructure"
+            echo "ssid=${WIFI_SSID}"
+            if [[ "${WIFI_HIDDEN:-no}" == "yes" ]]; then echo "hidden=true"; fi
+            echo
+            if [[ -n "${WIFI_PASS:-}" ]]; then
+                echo "[wifi-security]"
+                echo "key-mgmt=${kmgmt}"
+                echo "psk=${WIFI_PASS}"
+                echo
+            fi
+            echo "[ipv4]"
+            echo "method=auto"
+            echo
+            echo "[ipv6]"
+            echo "addr-gen-mode=default"
+            echo "method=auto"
+        } > "$f"
+    )
+    chmod 600 "$f"
+    ok "Profil Wi-Fi '${WIFI_SSID}' disimpan ke sistem baru."
+    unset WIFI_PASS
+}
+
 preflight() {
     [[ $EUID -eq 0 ]] || die "Jalankan sebagai root."
     [[ "$(uname -m)" == "x86_64" ]] || die "Script ini hanya untuk x86_64 (amd64)."
@@ -320,6 +719,7 @@ gather_config() {
     fi
 
     yesno INSTALL_BLUETOOTH "Install Bluetooth (bluez)?" yes
+    yesno INSTALL_PIPEWIRE  "Install PipeWire (audio + WirePlumber + pipewire-pulse + ALSA)?" yes
     yesno INSTALL_ELOGIND   "Install elogind + polkit (izin user untuk NetworkManager/CUPS/Bluetooth)?" yes
     yesno INSTALL_SSHD      "Aktifkan SSH server (sshd)?" no
     yesno INSTALL_CRON      "Install cronie (cron)?" yes
@@ -386,9 +786,10 @@ show_summary() {
  Binary package  : ${USE_BINPKG}     Update @world: ${UPDATE_WORLD}
  Firmware        : ${INSTALL_FIRMWARE} (SOF: ${INSTALL_SOF}, CPU: ${CPU_VENDOR})
  GPU             : ${GPU_DRIVER} (Vulkan: ${INSTALL_VULKAN})
- Jaringan        : NetworkManager + iwd (otomatis)
+ Jaringan        : NetworkManager + iwd (otomatis)$(if is_yes SAVE_WIFI && [[ -n "${WIFI_SSID:-}" ]]; then echo " — Wi-Fi '${WIFI_SSID}' akan disimpan"; fi)
  CUPS            : ${INSTALL_CUPS} (gutenprint=${CUPS_GUTENPRINT} hplip=${CUPS_HPLIP} brlaser=${CUPS_BRLASER} pdf=${CUPS_PDF} avahi=${CUPS_AVAHI})
  Bluetooth       : ${INSTALL_BLUETOOTH}
+ PipeWire        : ${INSTALL_PIPEWIRE}
  elogind/polkit  : ${INSTALL_ELOGIND}
  sshd / cron     : ${INSTALL_SSHD} / ${INSTALL_CRON} (fstrim=${ENABLE_FSTRIM})
  logger / chrony : ${INSTALL_LOGGER} / ${INSTALL_CHRONY}
@@ -529,7 +930,7 @@ CHROOT_VARS=(
     MIRROR HOST_NAME TIMEZONE SYS_LOCALE KEYMAP KERNEL_TYPE USE_BINPKG UPDATE_WORLD
     INSTALL_FIRMWARE INSTALL_SOF CPU_VENDOR GPU_DRIVER INSTALL_VULKAN MAKEJOBS
     INSTALL_CUPS CUPS_GUTENPRINT CUPS_HPLIP CUPS_BRLASER CUPS_PDF CUPS_AVAHI
-    INSTALL_BLUETOOTH INSTALL_ELOGIND INSTALL_SSHD INSTALL_CRON ENABLE_FSTRIM
+    INSTALL_BLUETOOTH INSTALL_PIPEWIRE INSTALL_ELOGIND INSTALL_SSHD INSTALL_CRON ENABLE_FSTRIM
     INSTALL_LOGGER INSTALL_CHRONY EXTRA_PKGS
     NEW_USER USER_HASH ROOT_HASH LOCK_ROOT SUDO_NOPASSWD NONINTERACTIVE
 )
@@ -600,6 +1001,8 @@ $(printf '\e[1;32m')=============== INSTALASI SELESAI ===============$(printf '\
    Wi-Fi      : nmtui    atau   nmcli device wifi connect <SSID> --ask
    Bluetooth  : bluetoothctl   (power on, scan on, pair, connect)
    Printer    : buka http://localhost:631  (login user di grup lpadmin)
+   Audio      : wpctl status  (PipeWire otomatis jalan di sesi desktop;
+                di TTY jalankan: gentoo-pipewire-launcher &)
    Update     : sudo emerge --sync && sudo emerge -avuDN @world
 =================================================
 EOF
@@ -619,18 +1022,20 @@ host_main() {
         # shellcheck disable=SC1090
         source "$CONFIG_FILE"
     fi
+    ensure_network
+    sync_clock
     gather_config
     show_summary
     confirm_wipe
     check_disk_unused
     hash_passwords
-    sync_clock
     resolve_stage3
     partition_disk
     format_disks
     mount_target
     fetch_stage3
     write_fstab
+    write_wifi_profile
     prepare_chroot
     run_chroot
     finish
@@ -728,6 +1133,12 @@ EOF
         local mesa_flags="vaapi"
         if is_yes INSTALL_VULKAN; then mesa_flags+=" vulkan"; fi
         echo "media-libs/mesa ${mesa_flags}" > "$pu/mesa"
+    fi
+    if is_yes INSTALL_PIPEWIRE; then
+        local pw_flags="sound-server pipewire-alsa alsa"
+        if is_yes INSTALL_BLUETOOTH; then pw_flags+=" bluetooth"; fi
+        echo "media-video/pipewire ${pw_flags}" > "$pu/pipewire"
+        if is_yes INSTALL_ELOGIND; then echo "media-video/wireplumber elogind" > "$pu/wireplumber"; fi
     fi
     if is_yes INSTALL_CUPS; then
         local cups_flags="usb"
@@ -837,6 +1248,10 @@ s_pkg_bluetooth() {
     emerge_pkgs net-wireless/bluez
 }
 
+s_pkg_pipewire() {
+    emerge_pkgs media-video/pipewire media-video/wireplumber media-sound/alsa-utils
+}
+
 s_pkg_misc() {
     local pkgs=()
     if is_yes INSTALL_CRON;   then pkgs+=(sys-process/cronie); fi
@@ -901,6 +1316,21 @@ EOF
         fi
     fi
 
+    # --- PipeWire (OpenRC): dijalankan per-sesi user lewat gentoo-pipewire-launcher ---
+    if is_yes INSTALL_PIPEWIRE; then
+        if command -v gentoo-pipewire-launcher >/dev/null 2>&1 \
+           && ! compgen -G "/etc/xdg/autostart/*pipewire*" >/dev/null; then
+            mkdir -p /etc/xdg/autostart
+            cat > /etc/xdg/autostart/gentoo-pipewire-launcher.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=PipeWire (gentoo-pipewire-launcher)
+Exec=/usr/bin/gentoo-pipewire-launcher restart
+NoDisplay=true
+EOF
+        fi
+    fi
+
     # --- TRIM mingguan ---
     if is_yes ENABLE_FSTRIM; then
         mkdir -p /etc/cron.weekly
@@ -943,6 +1373,7 @@ s_enable_services() {
         if is_yes CUPS_AVAHI; then enable_svc avahi-daemon default; fi
     fi
     if is_yes INSTALL_BLUETOOTH; then enable_svc bluetooth default; fi
+    if is_yes INSTALL_PIPEWIRE;  then enable_svc alsasound boot; fi
     if is_yes INSTALL_SSHD;      then enable_svc sshd default; fi
     if is_yes INSTALL_CRON;      then enable_svc cronie default; fi
     if is_yes INSTALL_LOGGER;    then enable_svc sysklogd default; fi
@@ -1000,6 +1431,7 @@ chroot_main() {
     if is_yes INSTALL_ELOGIND;   then step s_pkg_session; fi
     if is_yes INSTALL_CUPS;      then step s_pkg_cups; fi
     if is_yes INSTALL_BLUETOOTH; then step s_pkg_bluetooth; fi
+    if is_yes INSTALL_PIPEWIRE;  then step s_pkg_pipewire; fi
     step s_pkg_misc
     step s_pkg_extra
     step s_merge_configs
