@@ -73,7 +73,7 @@
 **2. Get the script onto the live system.** Either copy it from a USB stick, or download it once you have a network connection (run `net-setup` first if you need to get online):
 
 ```bash
-wget https://raw.githubusercontent.com/<your-user>/<your-repo>/main/gentoo-install.sh
+wget https://github.com/nyxneverdie/gentoo-installer/blob/main/gentoo-installer.sh
 ```
 
 **3. Run it:**
